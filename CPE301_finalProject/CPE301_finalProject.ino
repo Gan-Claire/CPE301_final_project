@@ -31,7 +31,7 @@
 //stepper pins
 #define STEPPER_PIN1 10
 #define STEPPER_PIN2 11
-#define STEEPER_PIN3 12
+#define STEPPER_PIN3 12
 #define STEPPER_PIN4 13
 
 //water pin
@@ -69,19 +69,145 @@ enum States{
   RUNNING,
   ERROR,
   START,
-}
+};
 
+
+States previous = START;
 States current = DISABLED;
-State previous = START;
+
+int lastTempPrint = 0;
+float temp = 0;
+float hum = 0;
+int stepperRate = 2048;
+bool fanOn = false;
+int ledC = -1;
+bool displayTempHum = false;
+bool stepperAllowed = false;
+bool monitorWater = false;
 
 void setup() {
   // put your setup code here, to run once:
+  PORTD |= (1 << PD0) | (1 << PD1);
+  RTC.begin();
+  DateTime now = DateTime(2023, 11, 30, 0, 0, 0);
+  RTC.adjust(now);
+
+  DDRE |= (0x01 << LED_pinGreen | 0x01 << LED_pinYellow);
+  DDRG |= (0x01 << LED_pinBlue);
+  DDRH |= (0x01 << LED_pinRed | 0x01 << water_level | 0x01 << motor_pin);
+
+  adc_init();
+  U0init(9600);
+  dht.begin();
+  lcd.begin(16, 2);
+  lcd.print("System begin");
+
+  DDRA &= ~(0x01 << BUTTON_RESET | 0x01 << BUTTON_ONOFF | 0x01 << button_top | 0x01 << button_bottom | 0x01 << button_up | 0x01 << button_down);
+
+  attachInterrupt(digitalPinToInterrupt(BUTTON_ONOFF), buttonOnOFF, RISING);
+  stepper.setSpeed(10);
 
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
+  DateTime now = RTC.now();
+  
+  if(displayTempHum){
+    // read the temperature and humidity from the DHT11 sensor
+    temp = dht.readTemperature();
+    hum = dht.readHumidity();
+  }
 
+  current = changeState(temp, hum, current);
+
+  if(readPin(BUTTON_ONOFF)){
+    buttonOnOFF();
+  }
+  // when state is switching exec
+  if(current != previous){
+    
+    writeTimeStampTransition(now, previous, current);
+    
+    // check the current state of the state machine
+    switch (current) {
+      case DISABLED:
+        fanOn = false;
+        ledC = 3;
+        displayTempHum = false;
+        stepperAllowed = true;
+        monitorWater = false;
+        break;
+
+      case IDLE:
+        fanOn = false;
+        ledC = 2;
+        displayTempHum = true;
+        stepperAllowed = true;
+        monitorWater = true;
+        break;
+
+      case RUNNING:
+        fanOn = true;
+        ledC = 1;
+        displayTempHum = true;
+        stepperAllowed = true;
+        monitorWater = true;
+        break;
+
+      case ERROR:
+        lcd.clear();
+        lcd.print("Error, low water level");
+        fanOn = false;
+        ledC = 0;
+        displayTempHum = true;
+        stepperAllowed = false;
+        monitorWater = true;
+        break;
+      case START:
+        break;
+    }
+  }
+  if(stepperAllowed){
+    //determine direction the user wants, the limits it can go, then set that speed
+    int stepperDirection = stepperRate * (readPin(button_up) ? 1 : readPin(button_bottom) ? -1 : 0);
+    //preform limit checks
+    stepperDirection = (readPin(button_top) ? min(stepperDirection, 0) : (readPin(button_bottom) ? max(stepperDirection ,0) : stepperDirection));
+    if(stepperDirection != 0){
+      writeStepperPos(now, previous, current);
+    }
+    setupStepperMotor(stepperDirection);
+  }
+  // set fan rate
+  setupStepperMotor(fanOn);
+
+  // set led
+  turnOnLED(ledC);
+
+  // display temp hum, if we are allowed to, and if the time since the last one has been greater then one minute
+  if(displayTempHum && abs(lastTempPrint - now.minute()) >= 1){
+    
+    lcd.clear();
+    lastTempPrint = now.minute(); // update prev
+    temp = dht.readTemperature();
+    hum = dht.readHumidity();
+    lcd.print("Temp, Humidity");
+    delay(1000);
+    lcd.clear();
+    lcd.print(temp); // write temp to lcd
+    lcd.print(hum); // write hum to lcd
+  }
+
+  previous = current;
+
+  if(monitorWater){
+    int waterLvl = adc_read(water_level); // calc water lvl
+    if(waterLvl <= water_threshold){
+      current = ERROR;
+    }
+  }
+  
+  delay(500);
 }
 
 
@@ -143,10 +269,10 @@ bool buttonOn = true;
 //handle button state
 void buttonOnOFF() {
   previous = current;
-  bool button_pressed = pinRead(BUTTON_ONOFF);
+  bool button_pressed = readPin(BUTTON_ONOFF);
   if(buttonOn && button_pressed){
     current = IDLE;
-    buttonON = false;
+    buttonOn = false;
   }
   else if (button_pressed){
     current = DISABLED;
@@ -245,13 +371,13 @@ void writeTimeStampTransition(DateTime now, States prevState, States currentStat
 }
 
 //determine the state of the system
-States changeState(float temp, int waterLevel, State current) {
+States changeState(float temp, int waterLevel, States current) {
   States state;
-  if (temp <= temp_threshold && current = RUNNING){
+  if (temp <= temp_threshold && current == RUNNING){
     state = IDLE;
   }
   else if (temp > temp_threshold && current == IDLE) {
-    state = RUNNING:
+    state = RUNNING;
   }
   else if (current == ERROR && readPin(BUTTON_RESET) && waterLevel > water_threshold) {
     state = IDLE;
@@ -266,24 +392,24 @@ States changeState(float temp, int waterLevel, State current) {
 //turn on LED
 void turnOnLED(int ledPin) {
   // turn off all
-  PORTH &= ~(0x01 << LED_PINR);
-  PORTG &= ~(0x01 << LED_PINB);
-  PORTE &= ~(0x01 << LED_PING);
-  PORTE &= ~(0x01 << LED_PINY);
+  PORTH &= ~(0x01 << LED_pinRed);
+  PORTG &= ~(0x01 << LED_pinBlue);
+  PORTE &= ~(0x01 << LED_pinGreen);
+  PORTE &= ~(0x01 << LED_pinYellow);
 
   //base on pin turn on corresponding LED
   switch (ledPin) {
     case 0:
-      PORTH |= 0x01 << LED_PINR;
+      PORTH |= 0x01 << LED_pinRed;
       break;
     case 1:
-      PORTG |= 0x01 << LED_PINB;
+      PORTG |= 0x01 << LED_pinBlue;
       break;
     case 2:
-      PORTE |= 0x01 << LED_PING;
+      PORTE |= 0x01 << LED_pinGreen;
       break;
     case 3:
-      PORTE |= 0x01 << LED_PINY;
+      PORTE |= 0x01 << LED_pinYellow;
       break;
   }
 }
@@ -296,9 +422,9 @@ void setupStepperMotor(int distance){
 //set up motor
 void setupMotor(bool on){
   if(on){
-    PORTH |= (0x01 << motor_pin)
+    PORTH |= (0x01 << motor_pin);
   }
   else {
-    PORTH &= ~(0x01 << motor_pin)
+    PORTH &= ~(0x01 << motor_pin);
   }
 }
